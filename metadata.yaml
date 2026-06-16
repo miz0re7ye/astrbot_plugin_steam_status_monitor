@@ -4,7 +4,7 @@ display_name: Steam 状态监控
 short_desc: 监控 Steam 好友在线/游戏状态变更并推送通知
 author: Maoer / miz0re7ye
 repo: https://github.com/miz0re7ye/astrbot_plugin_steam_status_monitor
-version: 2.3.0
+version: 2.3.1
 tags:
   - steam
   - game

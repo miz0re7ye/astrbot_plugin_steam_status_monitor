@@ -30,7 +30,7 @@ _ACTIVE_INSTANCE_ATTR = "_astrbot_plugin_steam_status_monitor_f_active_instance"
     "steam_status_monitor_f",
     "Maoer / miz0re7ye",
     "Steam状态监控插件V2版 (Fork)",
-    "2.3.0",
+    "2.3.1",
     "https://github.com/miz0re7ye/astrbot_plugin_steam_status_monitor"
 )
 class SteamStatusMonitorF(Star):
