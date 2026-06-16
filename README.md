@@ -44,9 +44,9 @@
 - 如果出现未知的无法提醒，但轮询显示正常的情况，请使用 /steam on/off 进行修复
 - 部分设备会出现2.1.7或以上版本无法正常进行信息推送的情况，需降级为2.1.6或以下版本使用。
 ## 演示截图
-![开始游戏示例](https://raw.githubusercontent.com/Maoer233/astrbot_plugin_steam_status_monitor/main/str.png)
-![结束游戏示例](https://raw.githubusercontent.com/Maoer233/astrbot_plugin_steam_status_monitor/main/stop.png)
-![成就推送示例](https://raw.githubusercontent.com/Maoer233/astrbot_plugin_steam_status_monitor/main/achievement.png)
+![开始游戏示例](str.png)
+![结束游戏示例](stop.png)
+![成就推送示例](achievement.png)
 
 
 ## 指令列表

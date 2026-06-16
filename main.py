@@ -28,10 +28,10 @@ _ACTIVE_INSTANCE_ATTR = "_astrbot_plugin_steam_status_monitor_f_active_instance"
 
 @register(
     "steam_status_monitor_f",
-    "Maoer",
+    "Maoer / miz0re7ye",
     "Steam状态监控插件V2版 (Fork)",
     "2.3.0",
-    "https://github.com/Maoer233/astrbot_plugin_steam_status_monitor"
+    "https://github.com/miz0re7ye/astrbot_plugin_steam_status_monitor"
 )
 class SteamStatusMonitorF(Star):
     def _get_group_data_path(self, group_id, key):
