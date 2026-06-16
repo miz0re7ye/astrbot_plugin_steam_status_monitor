@@ -432,6 +432,22 @@ class SteamStatusMonitorF(Star):
         start_play_times[sid] = converted
         return converted
 
+    def _clear_start_play_time(self, group_id, sid, gameid):
+        """确认游戏结束后清理开始时间，避免下次同一游戏复用旧时长。"""
+        start_play_times = self.group_start_play_times.get(group_id, {})
+        current = start_play_times.get(sid)
+        if isinstance(current, dict):
+            keys = [gameid]
+            gameid_str = str(gameid)
+            if gameid_str not in keys:
+                keys.append(gameid_str)
+            for key in keys:
+                current.pop(key, None)
+            if not current:
+                start_play_times.pop(sid, None)
+        elif sid in start_play_times:
+            start_play_times.pop(sid, None)
+
     def _register_active_instance(self):
         """记录当前插件实例，并在重载时终止旧实例任务。"""
         old_instance = getattr(builtins, _ACTIVE_INSTANCE_ATTR, None)
@@ -1637,6 +1653,7 @@ class SteamStatusMonitorF(Star):
                     poll_task.cancel()
                 self.achievement_snapshots.pop(key, None)
                 self.achievement_monitor.clear_game_achievements(group_id, sid, gameid)
+                self._clear_start_play_time(group_id, sid, gameid)
                 if sid in self.group_pending_quit.get(group_id, {}):
                     self.group_pending_quit[group_id][sid].pop(gameid, None)
                 # 清理延迟任务引用
@@ -1706,6 +1723,7 @@ class SteamStatusMonitorF(Star):
                     poll_task.cancel()
                 self.achievement_snapshots.pop(key, None)
                 self.achievement_monitor.clear_game_achievements(group_id, sid, gameid)
+                self._clear_start_play_time(group_id, sid, gameid)
                 self.group_pending_quit.get(group_id, {}).get(sid, {}).pop(gameid, None)
         except asyncio.CancelledError:
             logger.info(f"[延迟退出] 任务已取消 group_id={group_id} sid={sid} gameid={gameid}")
@@ -1828,7 +1846,7 @@ class SteamStatusMonitorF(Star):
                     last_states[sid] = status
                     continue  # 只推送网络波动提醒，跳过后续逻辑
                 # 修复：补充开始游戏推送逻辑
-                self._ensure_start_play_time_map(start_play_times, sid, current_gameid).setdefault(current_gameid, now)
+                self._ensure_start_play_time_map(start_play_times, sid, current_gameid)[current_gameid] = now
                 # 游戏播报过滤检查
                 if self._is_game_filtered(group_id, zh_game_name):
                     logger.info(f"[播报过滤] {name} 开始的游戏「{zh_game_name}」在过滤列表中，跳过推送")
@@ -1967,6 +1985,7 @@ class SteamStatusMonitorF(Star):
                             poll_task.cancel()
                         self.achievement_snapshots.pop(key, None)
                         self.achievement_monitor.clear_game_achievements(group_id, sid, gameid)
+                        self._clear_start_play_time(group_id, sid, gameid)
                         if gameid in pending_quit[sid]:
                             del pending_quit[sid][gameid]
                         continue
@@ -2045,6 +2064,7 @@ class SteamStatusMonitorF(Star):
                         logger.error(f"推送正常退出消息失败: {e}")
                     if gameid in pending_quit[sid]:
                         del pending_quit[sid][gameid]
+                    self._clear_start_play_time(group_id, sid, gameid)
 
         self._save_persistent_data()
         # 只返回日志字符串

@@ -46,10 +46,6 @@ async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_
                 # 优先取当前游戏的开始时间
                 if gameid and gameid in start_play_times[sid]:
                     start_time = start_play_times[sid][gameid]
-                else:
-                    # 如果没有当前游戏，取所有游戏的最晚开始时间
-                    if start_play_times[sid]:
-                        start_time = max(start_play_times[sid].values())
             else:
                 start_time = start_play_times.get(sid)
             play_seconds = now - start_time if start_time else 0
