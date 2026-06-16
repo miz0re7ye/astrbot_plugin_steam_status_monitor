@@ -1,5 +1,6 @@
 import time
 import io
+import os
 from typing import Optional
 from .steam_list_render import render_steam_list_image
 
@@ -109,6 +110,10 @@ async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_
             with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
                 tmp.write(buf.read())
                 tmp_path = tmp.name
-            yield event.image_result(tmp_path)
+            try:
+                yield event.image_result(tmp_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
     else:
         yield event.plain_result("渲染图片失败")

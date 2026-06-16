@@ -47,5 +47,29 @@
     "type": "bool",
     "hint": "控制台输出完整轮询日志（修改后重启AstrBot生效）",
     "default": true
+  },
+  "achievement_enabled": {
+    "description": "成就推送全局默认开关",
+    "type": "bool",
+    "hint": "新群默认是否开启成就推送（可使用 /steam achievement_on/off 分群控制）",
+    "default": false
+  },
+  "game_filter_list": {
+    "description": "游戏播报过滤关键词列表",
+    "type": "string",
+    "hint": "用逗号分隔，包含这些关键词的游戏名不会播报（模糊匹配），如 Wallpaper,Visual Novel。也可使用 /steam filter_add 等指令分群管理",
+    "default": ""
+  },
+  "max_achievement_notifications": {
+    "description": "单次成就推送最大数量",
+    "type": "int",
+    "hint": "一次解锁成就过多时，最多推送几条通知",
+    "default": 5
+  },
+  "group_steam_ids": {
+    "description": "分群SteamID列表（建议使用指令管理）",
+    "type": "string",
+    "hint": "JSON格式，如 {\"群号\": [\"SteamID1\", \"SteamID2\"]}。建议使用 /steam addid 指令管理，无需手动填写",
+    "default": "{}"
   }
 }

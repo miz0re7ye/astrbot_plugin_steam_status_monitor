@@ -3,7 +3,6 @@ import os
 import asyncio
 import httpx
 import io
-import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 from typing import Set, Optional, Dict, Any
 
@@ -424,7 +423,7 @@ class AchievementMonitor:
 
         y = padding_v + header_h + padding_v
 
-        async with aiohttp.ClientSession() as session:
+        async with httpx.AsyncClient(timeout=15) as client:
             idx = 0
             for apiname in new_achievements:
                 detail = achievement_details.get(apiname)
@@ -485,14 +484,13 @@ class AchievementMonitor:
                 icon_img = None
                 if icon_url:
                     try:
-                        async with session.get(icon_url) as response:
-                            if response.status == 200:
-                                icon_data = await response.read()
-                                icon_img = Image.open(io.BytesIO(icon_data)).convert("RGBA")
-                                icon_img = icon_img.resize((icon_size, icon_size), Image.LANCZOS)
-                                mask_icon = Image.new("L", (icon_size, icon_size), 0)
-                                ImageDraw.Draw(mask_icon).rounded_rectangle((0, 0, icon_size, icon_size), 12, fill=255)
-                                icon_img.putalpha(mask_icon)
+                        response = await client.get(icon_url)
+                        if response.status_code == 200:
+                            icon_img = Image.open(io.BytesIO(response.content)).convert("RGBA")
+                            icon_img = icon_img.resize((icon_size, icon_size), Image.LANCZOS)
+                            mask_icon = Image.new("L", (icon_size, icon_size), 0)
+                            ImageDraw.Draw(mask_icon).rounded_rectangle((0, 0, icon_size, icon_size), 12, fill=255)
+                            icon_img.putalpha(mask_icon)
                     except Exception:
                         pass
                 icon_x = card_x0 + 12

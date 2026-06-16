@@ -1,8 +1,18 @@
-name: steam_status_monitor_V2
+name: steam_status_monitor_f
 desc: 用于监控steam指定玩家的在线/离线/游戏状态变更，并在状态变化时推送通知。
+display_name: Steam 状态监控
+short_desc: 监控 Steam 好友在线/游戏状态变更并推送通知
 author: Maoer
 repo: https://github.com/Maoer233/astrbot_plugin_steam_status_monitor
-version: 2.2.0
+version: 2.3.0
 tags:
   - steam
+  - game
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - discord
+  - kook
+  - lark
 social_link: https://github.com/Maoer233

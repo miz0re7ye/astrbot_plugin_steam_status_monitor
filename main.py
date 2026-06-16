@@ -9,6 +9,7 @@ import httpx
 import asyncio
 import os
 import random
+import math
 from .openbox import handle_openbox  # 新增导入
 from .steam_list import handle_steam_list  # 新增导入
 import re
@@ -17,20 +18,22 @@ from .game_start_render import render_game_start  # 新增导入
 from .game_end_render import render_game_end  # 新增导入
 from PIL import Image as PILImage
 import io
-import requests  # 新增导入
 import tempfile
 import traceback
 import shutil
+import builtins
 from .superpower_util import load_abilities, get_daily_superpower  # 新增导入
 
+_ACTIVE_INSTANCE_ATTR = "_astrbot_plugin_steam_status_monitor_f_active_instance"
+
 @register(
-    "steam_status_monitor_V2",
+    "steam_status_monitor_f",
     "Maoer",
-    "Steam状态监控插件V2版",
-    "2.2.0",
+    "Steam状态监控插件V2版 (Fork)",
+    "2.3.0",
     "https://github.com/Maoer233/astrbot_plugin_steam_status_monitor"
 )
-class SteamStatusMonitorV2(Star):
+class SteamStatusMonitorF(Star):
     def _get_group_data_path(self, group_id, key):
         """获取分群数据文件路径"""
         return os.path.join(self.data_dir, f"group_{group_id}_{key}.json")
@@ -127,9 +130,10 @@ class SteamStatusMonitorV2(Star):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     self.notify_sessions = json.load(f)
-                logger.info(f"[SteamStatusMonitor] 已加载 notify_sessions: {self.notify_sessions}")
+                logger.info(f"[SteamStatusMonitorF] 已加载 notify_sessions: {self.notify_sessions}")
             except Exception as e:
                 logger.warning(f"加载 notify_sessions 失败: {e}")
+                self.notify_sessions = {}
         else:
             self.notify_sessions = {}
 
@@ -139,14 +143,153 @@ class SteamStatusMonitorV2(Star):
             try:
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(self.notify_sessions, f, ensure_ascii=False)
-                logger.info(f"[SteamStatusMonitor] 已保存 notify_sessions: {self.notify_sessions}")
+                logger.info(f"[SteamStatusMonitorF] 已保存 notify_sessions: {self.notify_sessions}")
             except Exception as e:
                 logger.warning(f"保存 notify_sessions 失败: {e}")
+
+    def _get_game_filters_path(self):
+        """获取游戏播报过滤列表文件路径"""
+        return os.path.join(self.data_dir, "game_filters.json")
+
+    def _load_game_filters(self):
+        """加载分群游戏播报过滤列表"""
+        path = self._get_game_filters_path()
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    self.group_game_filters = json.load(f)
+                self.group_game_filters = {
+                    str(group_id): self._parse_filter_keywords(filters)
+                    for group_id, filters in self.group_game_filters.items()
+                }
+                logger.info(f"[SteamStatusMonitorF] 已加载 game_filters.json")
+            except Exception as e:
+                logger.warning(f"加载 game_filters.json 失败: {e}")
+                self.group_game_filters = {}
+        else:
+            self.group_game_filters = {}
+
+    def _save_game_filters(self):
+        """保存分群游戏播报过滤列表"""
+        path = self._get_game_filters_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.group_game_filters, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存 game_filters.json 失败: {e}")
+
+    def _parse_filter_keywords(self, value):
+        """解析游戏过滤关键词，去重并保留原始大小写。"""
+        if not value:
+            return []
+        if isinstance(value, str):
+            raw_items = re.split(r"[,，\n]+", value)
+        else:
+            raw_items = list(value)
+        keywords = []
+        seen = set()
+        for item in raw_items:
+            keyword = str(item).strip()
+            key = keyword.lower()
+            if keyword and key not in seen:
+                keywords.append(keyword)
+                seen.add(key)
+        return keywords
+
+    def _get_global_filter_keywords_path(self):
+        """记录上一次从配置同步的全局过滤关键词。"""
+        return os.path.join(self.data_dir, "global_filter_keywords.json")
+
+    def _load_previous_global_filters(self):
+        path = self._get_global_filter_keywords_path()
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return self._parse_filter_keywords(json.load(f))
+        except Exception as e:
+            logger.warning(f"加载 global_filter_keywords.json 失败: {e}")
+            return []
+
+    def _save_global_filters_marker(self, keywords):
+        path = self._get_global_filter_keywords_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(keywords, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存 global_filter_keywords.json 失败: {e}")
+
+    def _sync_global_filters(self):
+        """同步配置中的全局过滤词，并清理旧版本注入到分群列表里的全局词。"""
+        current_global = self._parse_filter_keywords(self.config.get("game_filter_list", ""))
+        previous_global = self._load_previous_global_filters()
+        previous_keys = {kw.lower() for kw in previous_global}
+
+        changed = False
+        if previous_keys:
+            current_keys = {kw.lower() for kw in current_global}
+            for group_id, filters in list(self.group_game_filters.items()):
+                group_filters = self._parse_filter_keywords(filters)
+                cleaned = [
+                    kw for kw in group_filters
+                    if kw.lower() not in previous_keys or kw.lower() in current_keys
+                ]
+                if cleaned != group_filters:
+                    self.group_game_filters[group_id] = cleaned
+                    changed = True
+
+        self._global_game_filters = current_global
+        if changed:
+            self._save_game_filters()
+        self._save_global_filters_marker(current_global)
+        logger.info(f"[SteamStatusMonitorF] 已同步全局游戏过滤关键词: {current_global}")
+
+    def _is_game_filtered(self, group_id, game_name):
+        """检查游戏名是否命中全局或本群播报过滤列表（模糊匹配，不区分大小写）"""
+        if not game_name:
+            return False
+        group_id = str(group_id)
+        filters = (
+            self._parse_filter_keywords(getattr(self, "_global_game_filters", []))
+            + self._parse_filter_keywords(self.group_game_filters.get(group_id, []))
+        )
+        game_name_lower = game_name.lower()
+        for keyword in filters:
+            if keyword and keyword.lower() in game_name_lower:
+                return True
+        return False
+
+    def _get_achievement_toggle_path(self):
+        """获取成就推送开关文件路径"""
+        return os.path.join(self.data_dir, "achievement_toggle.json")
+
+    def _load_achievement_toggle(self):
+        """加载分群成就推送开关状态"""
+        path = self._get_achievement_toggle_path()
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    self.group_achievement_enabled = json.load(f)
+                logger.info(f"[SteamStatusMonitorF] 已加载 achievement_toggle.json")
+            except Exception as e:
+                logger.warning(f"加载 achievement_toggle.json 失败: {e}")
+                self.group_achievement_enabled = {}
+        else:
+            self.group_achievement_enabled = {}
+
+    def _save_achievement_toggle(self):
+        """保存分群成就推送开关状态"""
+        path = self._get_achievement_toggle_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.group_achievement_enabled, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存 achievement_toggle.json 失败: {e}")
 
     def _ensure_fonts(self):
         """检测插件fonts目录是否有NotoSansHans系列字体，有则复制到缓存目录并缓存路径"""
         plugin_fonts_dir = os.path.join(os.path.dirname(__file__), 'fonts')
-        cache_fonts_dir = os.path.join('data', 'steam_status_monitor', 'fonts')
+        cache_fonts_dir = os.path.join('data', 'steam_status_monitor_f', 'fonts')
         os.makedirs(plugin_fonts_dir, exist_ok=True)
         os.makedirs(cache_fonts_dir, exist_ok=True)
         font_candidates = [
@@ -182,6 +325,21 @@ class SteamStatusMonitorV2(Star):
         """获取 steam_groups.json 文件路径"""
         return os.path.join(self.data_dir, "steam_groups.json")
 
+    def _normalize_group_steam_ids(self, group_steam_ids):
+        normalized = {}
+        if not isinstance(group_steam_ids, dict):
+            return normalized
+        for group_id, steam_ids in group_steam_ids.items():
+            if isinstance(steam_ids, str):
+                items = [x.strip() for x in re.split(r"[,，\s.]+", steam_ids) if x.strip()]
+            else:
+                try:
+                    items = [str(x).strip() for x in steam_ids if str(x).strip()]
+                except TypeError:
+                    items = []
+            normalized[str(group_id)] = items
+        return normalized
+
     def _load_group_steam_ids(self):
         """从 steam_groups.json 加载所有群的 SteamID 列表"""
         path = self._get_groups_file_path()
@@ -189,11 +347,19 @@ class SteamStatusMonitorV2(Star):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     self.group_steam_ids = json.load(f)
-                logger.info(f"[SteamStatusMonitor] 已加载 steam_groups.json: {self.group_steam_ids}")
+                self.group_steam_ids = self._normalize_group_steam_ids(self.group_steam_ids)
+                logger.info(f"[SteamStatusMonitorF] 已加载 steam_groups.json: {self.group_steam_ids}")
             except Exception as e:
                 logger.warning(f"加载 steam_groups.json 失败: {e}")
         else:
-            self.group_steam_ids = {}
+            if isinstance(self.group_steam_ids, str):
+                try:
+                    self.group_steam_ids = json.loads(self.group_steam_ids)
+                except Exception:
+                    self.group_steam_ids = {}
+            if not isinstance(self.group_steam_ids, dict):
+                self.group_steam_ids = {}
+            self.group_steam_ids = self._normalize_group_steam_ids(self.group_steam_ids)
 
     def _save_group_steam_ids(self):
         """保存所有群的 SteamID 列表到 steam_groups.json"""
@@ -201,7 +367,7 @@ class SteamStatusMonitorV2(Star):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self.group_steam_ids, f, ensure_ascii=False, indent=2)
-            logger.info(f"[SteamStatusMonitor] 已保存 steam_groups.json: {self.group_steam_ids}")
+            logger.info(f"[SteamStatusMonitorF] 已保存 steam_groups.json: {self.group_steam_ids}")
         except Exception as e:
             logger.warning(f"保存 steam_groups.json 失败: {e}")
 
@@ -211,6 +377,7 @@ class SteamStatusMonitorV2(Star):
 
     def _load_push_groups(self):
         """加载 SteamID -> 群号列表 的推送映射"""
+        self.push_groups = {}
         path = self._get_push_groups_path()
         if os.path.exists(path):
             try:
@@ -218,8 +385,6 @@ class SteamStatusMonitorV2(Star):
                     self.push_groups = json.load(f)
             except Exception as e:
                 logger.warning(f"加载 push_groups.json 失败: {e}")
-        else:
-            self.push_groups = {}
 
     def _save_push_groups(self):
         """保存 SteamID -> 群号列表 的推送映射"""
@@ -235,11 +400,37 @@ class SteamStatusMonitorV2(Star):
             return default
         return str(value).rstrip("/")
 
+    @staticmethod
+    def _log_background_task_result(task):
+        try:
+            result = task.result()
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                logger.warning(f"[生命周期] 后台任务结束时出现异常: {result}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"[生命周期] 后台任务结束时出现异常: {e}")
+
+    def _register_active_instance(self):
+        """记录当前插件实例，并在重载时终止旧实例任务。"""
+        old_instance = getattr(builtins, _ACTIVE_INSTANCE_ATTR, None)
+        if old_instance is self:
+            return
+        if old_instance and getattr(old_instance, "_ssm_running", False):
+            logger.warning("[生命周期] 检测到旧插件实例仍在运行，正在终止旧任务以避免重复播报。")
+            try:
+                shutdown_task = asyncio.create_task(old_instance.terminate())
+                shutdown_task.add_done_callback(self._log_background_task_result)
+            except RuntimeError as e:
+                logger.warning(f"[生命周期] 无法调度旧插件实例终止任务: {e}")
+        setattr(builtins, _ACTIVE_INSTANCE_ATTR, self)
+
     def __init__(self, context: Context, config=None):
         # 插件运行状态标志，重启后自动丢失
         if hasattr(self, '_ssm_running') and self._ssm_running:
             logger.error("当前插件已在运行中。请重启astrbot而非重载插件")
             return
+        self._register_active_instance()
         self._ssm_running = True
         self._ensure_fonts()  # 插件启动时自动检测/下载字体
         self.context = context
@@ -258,15 +449,6 @@ class SteamStatusMonitorV2(Star):
         self._game_name_cache = {}  # 修复: 游戏名缓存，防止 AttributeError
         # 统一使用 AstrBot 配置系统
         self.config = config or {}
-        # 兼容旧逻辑，若 config 为空则尝试读取 config.json（可选，建议后续移除）
-        if not self.config:
-            try:
-                config_path = os.path.join(os.path.dirname(__file__), 'config.json')
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    self.config = json.load(f)
-            except Exception as e:
-                logger.error(f"steam_status_monitor 配置读取失败: {e}")
-                self.config = {}
         # 旧配置迁移：如存在 steam_ids（未分群），迁移到 group_steam_ids['default']
         if 'steam_ids' in self.config and 'group_steam_ids' not in self.config:
             steam_ids = self.config.get('steam_ids', [])
@@ -290,8 +472,6 @@ class SteamStatusMonitorV2(Star):
         self.max_group_size = 20
         self.GROUP_ID = None  # 当前操作群号，指令时动态赋值
         self.fixed_poll_interval = self.config.get('fixed_poll_interval', 0)  # 新增：固定轮询间隔，0为智能轮询
-        self.poll_interval_mid_sec = self.config.get('poll_interval_mid_sec', 600)  # 10分钟
-        self.poll_interval_long_sec = self.config.get('poll_interval_long_sec', 1800)  # 30分钟
         self.next_poll_time = {}  # {group_id: {steamid: next_time}}
         self.detailed_poll_log = self.config.get('detailed_poll_log', True)
         # 新增：智能轮询间隔配置 [游戏中, 12分钟内, 12分钟~3小时, 3小时~24小时, 24~48小时, 超过48小时]
@@ -301,11 +481,16 @@ class SteamStatusMonitorV2(Star):
         else:
             self.smart_poll_intervals = list(raw_intervals)
         # 数据持久化目录
-        self.data_dir = os.path.join("data", "steam_status_monitor")
+        self.data_dir = os.path.join("data", "steam_status_monitor_f")
         os.makedirs(self.data_dir, exist_ok=True)
         self._load_group_steam_ids()  # 新增：优先从 steam_groups.json 加载
         self._load_persistent_data()
         self._load_notify_session()
+        self._load_game_filters()
+        self._load_achievement_toggle()
+        self._sync_global_filters()
+        # 读取成就推送全局默认值，用于未设置的群
+        self._achievement_default = self.config.get('achievement_enabled', False)
         # 成就监控
         self.achievement_monitor = AchievementMonitor(self.data_dir, steam_api_base=self.STEAM_API_BASE)
         self.max_achievement_notifications = self.config.get('max_achievement_notifications', 5)
@@ -313,33 +498,37 @@ class SteamStatusMonitorV2(Star):
         self.achievement_snapshots = {}   # {(group_id, sid, gameid): [成就列表]}
         self.achievement_blacklist = set()  # 新增：成就查询黑名单
         self.achievement_fail_count = {}    # 新增：成就查询失败计数
+        self._pending_quit_tasks = {}       # {group_id: {sid: {gameid: asyncio.Task}}} 延迟退出检查任务
+        self._fire_and_forget_tasks = set() # 一次性后台任务集合，terminate 时统一取消
         # --- 新增：重启后自动推送 ---
         self.running_groups = set()  # 正在运行的群号集合
         self.group_monitor_enabled = {}      # {group_id: bool} 监控开关
-        self.group_achievement_enabled = {}  # {group_id: bool} 成就推送开关
+        # group_achievement_enabled 已由 _load_achievement_toggle() 加载，此处不再覆盖
         # --- 新增：重启后自动恢复所有群的轮询 ---
         if hasattr(self, 'notify_sessions') and self.notify_sessions and self.API_KEY and self.group_steam_ids:
-            logger.info(f"[SteamStatusMonitor] 检测到 notify_sessions={self.notify_sessions}，自动启动监控轮询")
+            logger.info(f"[SteamStatusMonitorF] 检测到 notify_sessions={self.notify_sessions}，自动启动监控轮询")
             for group_id in self.notify_sessions:
                 if group_id in self.group_steam_ids:
                     self.running_groups.add(group_id)
         # --- 新增：全局日志收集与统一输出 ---
         self._last_round_logs = []  # [(group_id, logstr)]
-        asyncio.create_task(self.global_poll_and_log_loop())
-        asyncio.create_task(self.init_poll_time_once())
         # SGDB API Key 可在 https://www.steamgriddb.com/profile/preferences/api 获取
         self.SGDB_API_KEY = self.config.get('sgdb_api_key', '')
         self.SGDB_API_BASE = self._normalize_base_url(
             self.config.get('sgdb_api_base', ''),
             'https://www.steamgriddb.com'
         )
-        self._load_push_groups()  # <--- 修复：确保push_groups属性初始化
+        self._load_push_groups()  # 确保 push_groups 在 create_task 前加载
+        self._poll_loop_task = asyncio.create_task(self.global_poll_and_log_loop())
+        self._init_poll_task = asyncio.create_task(self.init_poll_time_once())
 
     async def init_poll_time_once(self):
         '''插件启动后10秒内进行一次全员初始化轮询，设置每个SteamID的next_poll_time，并输出一次初始日志'''
         await asyncio.sleep(10)
         all_logs = []
         for group_id in self.group_steam_ids:
+            if group_id not in self.running_groups:
+                continue
             steam_ids = self.group_steam_ids[group_id]
             group_lines = []
             for sid in steam_ids:
@@ -354,92 +543,125 @@ class SteamStatusMonitorV2(Star):
     async def global_poll_and_log_loop(self):
         '''全局定时并发查询所有群Steam状态，按动态间隔判断是否需要查询，40秒统一输出日志'''
         while True:
-            # 计算距离下一个整分钟0秒的秒数
-            now = time.time()
-            next_minute = (int(now) // 60 + 1) * 60
-            await asyncio.sleep(max(0, next_minute - now))
-            # 0秒：遍历所有群和SteamID，按动态间隔判断是否需要查询
-            group_ids = list(self.group_steam_ids.keys())
-            poll_tasks = []
-            for group_id in group_ids:
-                if not self.group_monitor_enabled.get(group_id, True):
-                    continue
-                steam_ids = self.group_steam_ids.get(group_id, [])
-                next_poll = self.next_poll_time.setdefault(group_id, {})
-                now2 = time.time()
-                # 只查询到点的SteamID
-                sids_to_query = [sid for sid in steam_ids if now2 >= next_poll.get(sid, 0)]
-                if not sids_to_query:
-                    continue
-                async def query_one_group(gid, sids):
-                    round_msg_lines = []
-                    tasks = [self.check_status_change(gid, single_sid=sid) for sid in sids]
-                    if tasks:
-                        results = await asyncio.gather(*tasks)
-                        for msg in results:
-                            if msg:
-                                round_msg_lines.append(msg)
-                    if round_msg_lines:
-                        self._last_round_logs.append((gid, "\n".join(round_msg_lines)))
-                poll_tasks.append(query_one_group(group_id, sids_to_query))
-            if poll_tasks:
-                await asyncio.gather(*poll_tasks)
-            # 40秒统一输出日志
-            await asyncio.sleep(40)
-            if self._last_round_logs:
-                if self.detailed_poll_log:
-                    all_logs = []
-                    for group_id, logstr in self._last_round_logs:
-                        all_logs.append(f"群{group_id}：\n" + logstr)
-                    logger.info("====== Steam状态监控轮询日志 ======\n" + "\n".join(all_logs) + "\n=====================================================")
-                else:
-                    logger.info("周期轮询成功")
-                self._last_round_logs.clear()
+            try:
+                # 计算距离下一个整分钟0秒的秒数
+                now = time.time()
+                next_minute = (int(now) // 60 + 1) * 60
+                await asyncio.sleep(max(0, next_minute - now))
+                # 0秒：遍历所有群和SteamID，按动态间隔判断是否需要查询
+                group_ids = list(self.group_steam_ids.keys())
+                poll_tasks = []
+                for group_id in group_ids:
+                    if group_id not in self.running_groups:
+                        continue
+                    if not self.group_monitor_enabled.get(group_id, True):
+                        continue
+                    steam_ids = self.group_steam_ids.get(group_id, [])
+                    next_poll = self.next_poll_time.setdefault(group_id, {})
+                    now2 = time.time()
+                    # 只查询到点的SteamID
+                    sids_to_query = [sid for sid in steam_ids if now2 >= next_poll.get(sid, 0)]
+                    if not sids_to_query:
+                        continue
+                    async def query_one_group(gid, sids):
+                        round_msg_lines = []
+                        tasks = [self.check_status_change(gid, single_sid=sid) for sid in sids]
+                        if tasks:
+                            results = await asyncio.gather(*tasks, return_exceptions=True)
+                            for msg in results:
+                                if isinstance(msg, BaseException):
+                                    logger.warning(f"[轮询] 群{gid} 查询异常: {msg}")
+                                elif msg:
+                                    round_msg_lines.append(msg)
+                        if round_msg_lines:
+                            self._last_round_logs.append((gid, "\n".join(round_msg_lines)))
+                    poll_tasks.append(query_one_group(group_id, sids_to_query))
+                if poll_tasks:
+                    await asyncio.gather(*poll_tasks, return_exceptions=True)
+                # 40秒统一输出日志
+                await asyncio.sleep(40)
+                if self._last_round_logs:
+                    if self.detailed_poll_log:
+                        all_logs = []
+                        for group_id, logstr in self._last_round_logs:
+                            all_logs.append(f"群{group_id}：\n" + logstr)
+                        logger.info("====== Steam状态监控轮询日志 ======\n" + "\n".join(all_logs) + "\n=====================================================")
+                    else:
+                        logger.info("周期轮询成功")
+                    self._last_round_logs.clear()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[轮询] 全局轮询循环异常: {e}\n{traceback.format_exc()}")
+                await asyncio.sleep(60)  # 异常后等待1分钟再重试，避免疯狂重试
 
     async def terminate(self):
         '''插件被卸载/停用时自动保存持久化数据'''
-        self._save_persistent_data()
-        # 停止所有成就定时任务
-        for task in self.achievement_poll_tasks.values():
-            task.cancel()
-        self.achievement_poll_tasks.clear()
-        self.achievement_snapshots.clear()
+        self._ssm_running = False
+        try:
+            self._save_persistent_data()
+            self._save_game_filters()
+            self._save_achievement_toggle()
+            self._save_notify_session()
+            self._save_push_groups()
+            # 停止全局轮询任务和初始化任务
+            await self._cancel_tasks(
+                [getattr(self, task_attr, None) for task_attr in ('_poll_loop_task', '_init_poll_task')],
+                "主轮询任务"
+            )
+            # 取消所有运行时异步任务（成就轮询、延迟退出、一次性后台任务）
+            await self._cancel_all_runtime_tasks()
+        finally:
+            if getattr(builtins, _ACTIVE_INSTANCE_ATTR, None) is self:
+                setattr(builtins, _ACTIVE_INSTANCE_ATTR, None)
 
-    def crop_image_auto(self, img_path_or_bytes, bg_color=(20,26,33), threshold=25):
+    async def crop_image_auto(self, img_path_or_bytes, bg_color=(20,26,33), threshold=25):
         """
         自动裁剪图片内容区域，去除边缘与 bg_color 相近的空白。
         支持本地路径、bytes、URL、PIL.Image。
         """
-        import numpy as np
         # 新增：如果已经是PIL.Image对象，直接用
         if isinstance(img_path_or_bytes, PILImage.Image):
             img = img_path_or_bytes.convert("RGB")
         elif isinstance(img_path_or_bytes, str) and (img_path_or_bytes.startswith("http://") or img_path_or_bytes.startswith("https://")):
-            resp = requests.get(img_path_or_bytes)
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(img_path_or_bytes)
             img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
         elif isinstance(img_path_or_bytes, bytes):
             img = PILImage.open(io.BytesIO(img_path_or_bytes)).convert("RGB")
         else:
             img = PILImage.open(img_path_or_bytes).convert("RGB")
-        arr = np.array(img)
-        # 自动检测背景色（取四角平均色）
-        h, w, _ = arr.shape
-        corners = [arr[0,0], arr[0,-1], arr[-1,0], arr[-1,-1]]
-        avg_bg = np.mean(corners, axis=0)
-        # 计算每个像素与背景色的距离
-        diff = np.abs(arr - avg_bg).sum(axis=2)
-        mask = diff > threshold
-        coords = np.argwhere(mask)
-        if coords.size == 0:
+
+        width, height = img.size
+        pixels = img.load()
+        corners = [
+            pixels[0, 0],
+            pixels[width - 1, 0],
+            pixels[0, height - 1],
+            pixels[width - 1, height - 1],
+        ]
+        avg_bg = tuple(sum(pixel[channel] for pixel in corners) / 4 for channel in range(3))
+
+        left, top, right, bottom = width, height, -1, -1
+        for y in range(height):
+            for x in range(width):
+                pixel = pixels[x, y]
+                diff = sum(abs(pixel[channel] - avg_bg[channel]) for channel in range(3))
+                if diff > threshold:
+                    left = min(left, x)
+                    top = min(top, y)
+                    right = max(right, x)
+                    bottom = max(bottom, y)
+
+        if right < left or bottom < top:
             return img
-        y0, x0 = coords.min(axis=0)
-        y1, x1 = coords.max(axis=0) + 1
+
         # 防止裁剪过度，留出2px边距
-        y0 = max(y0 - 0, 0)
-        x0 = max(x0 - 0, 0)
-        y1 = min(y1 - 0, arr.shape[0])
-        x1 = min(x1 - 0, arr.shape[1])
-        cropped = img.crop((x0, y0, x1, y1))
+        left = max(left - 2, 0)
+        top = max(top - 2, 0)
+        right = min(right + 3, width)
+        bottom = min(bottom + 3, height)
+        cropped = img.crop((left, top, right, bottom))
         return cropped
 
     async def fetch_player_status(self, steam_id, retry=None):
@@ -644,38 +866,48 @@ class SteamStatusMonitorV2(Star):
     async def achievement_delayed_final_check(self, group_id, sid, gameid, player_name, game_name):
         '''游戏结束后延迟5分钟再做一次成就对比，失败多次自动加入黑名单'''
         key = (group_id, sid, gameid)
-        await asyncio.sleep(300)  # 5分钟
-        # 黑名单跳过
-        if gameid in self.achievement_blacklist:
-            logger.info(f"[成就结束冗余对比] 游戏 {gameid} 已在黑名单，跳过轮询")
-            return
-        achievements_a = self.achievement_snapshots.get(key)
-        achievements_b = await self.achievement_monitor.get_player_achievements(
-            self.API_KEY, group_id, sid, gameid
-        )
-        today = time.strftime('%Y-%m-%d')
-        fail_key = (gameid, today)
-        if achievements_b is None:
-            cnt = self.achievement_fail_count.get(fail_key, 0) + 1
-            self.achievement_fail_count[fail_key] = cnt
-            if cnt >= 10:
-                self.achievement_blacklist.add(gameid)
-                logger.info(f"[成就黑名单] 游戏 {gameid} 当天累计获取失败10次，已加入黑名单")
+        try:
+            await asyncio.sleep(300)  # 5分钟
+            # 黑名单跳过
+            if gameid in self.achievement_blacklist:
+                logger.info(f"[成就结束冗余对比] 游戏 {gameid} 已在黑名单，跳过轮询")
                 return
-        if achievements_a is not None and achievements_b is not None:
-            new_achievements = set(achievements_b) - set(achievements_a)
-            if new_achievements:
-                logger.info(f"[成就结束冗余对比] {player_name} 在 {game_name} 解锁新成就：{', '.join(new_achievements)}")
-                await self.notify_new_achievements(group_id, sid, player_name, gameid, game_name, new_achievements)
-            else:
-                logger.info(f"[成就结束冗余对比] {player_name} 在 {game_name} 未发现新成就")
-        # 清理快照和定时任务
-        self.achievement_snapshots.pop(key, None)
-        self.achievement_poll_tasks.pop(key, None)
-        self.achievement_monitor.clear_game_achievements(group_id, sid, gameid)
+            achievements_a = self.achievement_snapshots.get(key)
+            achievements_b = await self.achievement_monitor.get_player_achievements(
+                self.API_KEY, group_id, sid, gameid
+            )
+            today = time.strftime('%Y-%m-%d')
+            fail_key = (gameid, today)
+            if achievements_b is None:
+                cnt = self.achievement_fail_count.get(fail_key, 0) + 1
+                self.achievement_fail_count[fail_key] = cnt
+                if cnt >= 10:
+                    self.achievement_blacklist.add(gameid)
+                    logger.info(f"[成就黑名单] 游戏 {gameid} 当天累计获取失败10次，已加入黑名单")
+                    return
+            if achievements_a is not None and achievements_b is not None:
+                new_achievements = set(achievements_b) - set(achievements_a)
+                if new_achievements:
+                    logger.info(f"[成就结束冗余对比] {player_name} 在 {game_name} 解锁新成就：{', '.join(new_achievements)}")
+                    await self.notify_new_achievements(group_id, sid, player_name, gameid, game_name, new_achievements)
+                else:
+                    logger.info(f"[成就结束冗余对比] {player_name} 在 {game_name} 未发现新成就")
+        except asyncio.CancelledError:
+            logger.info(f"[成就结束对比] 任务已取消 group_id={group_id} sid={sid} gameid={gameid}")
+            raise
+        except Exception as e:
+            logger.error(f"[成就结束对比] group_id={group_id} sid={sid} gameid={gameid} 异常: {e}\n{traceback.format_exc()}")
+        finally:
+            self.achievement_snapshots.pop(key, None)
+            self.achievement_poll_tasks.pop(key, None)
+            self.achievement_monitor.clear_game_achievements(group_id, sid, gameid)
 
     async def notify_new_achievements(self, group_id, steamid, player_name, gameid, game_name, new_achievements):
-        if not self.group_achievement_enabled.get(group_id, True):
+        if not self.group_achievement_enabled.get(group_id, self._achievement_default):
+            return
+        # 游戏播报过滤检查
+        if self._is_game_filtered(group_id, game_name):
+            logger.info(f"[播报过滤] {player_name} 在「{game_name}」的成就推送在过滤列表中，跳过")
             return
         if not new_achievements or not self.notify_sessions:
             return
@@ -711,17 +943,18 @@ class SteamStatusMonitorV2(Star):
                 unlocked_set = set(self.achievement_snapshots.get(key, []))
             if unlocked_set is None:
                 unlocked_set = set()
+            tmp_path = None
             try:
                 img_bytes = await self.achievement_monitor.render_achievement_image(details, set(achievements_to_notify), player_name=player_name, steamid=steamid, appid=gameid, unlocked_set=unlocked_set, font_path=font_path)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                    tmp.write(img_bytes)
-                    tmp_path = tmp.name
+                tmp_path = self._create_temp_image(img_bytes)
                 for session in notify_sessions:
                     await self.context.send_message(session, MessageChain([Image.fromFileSystem(tmp_path)]))
                 return
             except Exception as e:
                 import traceback
                 logger.error(f"成就图片渲染失败: {e}\n{traceback.format_exc()}")
+            finally:
+                self._cleanup_temp_file(tmp_path)
         # 文本推送
         message = f"🎉 {player_name} 在 {game_name} 中解锁了新成就!\n"
         for achievement in achievements_to_notify:
@@ -783,10 +1016,10 @@ class SteamStatusMonitorV2(Star):
         '''添加SteamID到本群监控列表（分群），支持多个ID用逗号分隔'''
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
         # 支持多个ID同时输入
-        steamid_list = [x.strip() for x in steamid.split(".") if x.strip()]
+        steamid_list = [x.strip() for x in re.split(r"[,，\s.]+", steamid) if x.strip()]
         invalid_ids = [sid for sid in steamid_list if not sid.isdigit() or len(sid) != 17]
         if invalid_ids:
-            yield event.plain_result(f"以下SteamID无效（需为64位数字串，17位）：{'.'.join(invalid_ids)}")
+            yield event.plain_result(f"以下SteamID无效（需为64位数字串，17位）：{', '.join(invalid_ids)}")
             return
         steam_ids = self.group_steam_ids.setdefault(group_id, [])
         added = []
@@ -804,9 +1037,9 @@ class SteamStatusMonitorV2(Star):
         self._save_group_steam_ids()  # 新增：保存到 steam_groups.json
         msg = ""
         if added:
-            msg += f"已为本群添加SteamID: {'.'.join(added)}\n"
+            msg += f"已为本群添加SteamID: {', '.join(added)}\n"
         if already:
-            msg += f"以下SteamID已存在于本群监控组: {'.'.join(already)}\n"
+            msg += f"以下SteamID已存在于本群监控组: {', '.join(already)}\n"
         if len(steam_ids) >= limit and len(added) < len(steamid_list):
             msg += f"本群监控组人数已达上限（{limit}人），部分ID未添加。\n"
         yield event.plain_result(msg.strip() if msg else "未添加任何SteamID。")
@@ -869,9 +1102,25 @@ class SteamStatusMonitorV2(Star):
         old = self.config[key]
         if key == "smart_poll_intervals":
             # 支持字符串输入
-            value_list = [int(x.strip()) for x in value.split(",") if x.strip()]
+            try:
+                value_list = [int(x.strip()) for x in value.split(",") if x.strip()]
+            except Exception:
+                yield event.plain_result("类型错误，smart_poll_intervals 应为逗号分隔的整数")
+                return
+            if len(value_list) != 6 or any(x <= 0 for x in value_list):
+                yield event.plain_result("smart_poll_intervals 需要 6 个正整数")
+                return
             value = ",".join(str(x) for x in value_list)
             self.smart_poll_intervals = value_list
+        elif isinstance(old, bool):
+            normalized = value.strip().lower()
+            if normalized in ("true", "1", "yes", "on", "开启", "开"):
+                value = True
+            elif normalized in ("false", "0", "no", "off", "关闭", "关"):
+                value = False
+            else:
+                yield event.plain_result("类型错误，应为布尔值 true/false")
+                return
         elif isinstance(old, int):
             try:
                 value = int(value)
@@ -907,20 +1156,111 @@ class SteamStatusMonitorV2(Star):
         self.RETRY_TIMES = self.config.get('retry_times', 3)
         self.GROUP_ID = self.config.get('notify_group_id', None)
         self.fixed_poll_interval = self.config.get('fixed_poll_interval', 0)
+        self.max_achievement_notifications = self.config.get('max_achievement_notifications', 5)
+        self.detailed_poll_log = self.config.get('detailed_poll_log', True)
         # 重新解析智能轮询间隔
         raw_intervals = self.config.get('smart_poll_intervals', "1,3,5,10,20,30")
         if isinstance(raw_intervals, str):
             self.smart_poll_intervals = [int(x.strip()) for x in raw_intervals.split(",") if x.strip()]
         else:
             self.smart_poll_intervals = list(raw_intervals)
+        # 同步成就推送全局默认值
+        self._achievement_default = self.config.get('achievement_enabled', False)
+        self._sync_global_filters()
         if hasattr(self.config, "save_config"):
             self.config.save_config()
         yield event.plain_result(f"已设置 {key} = {value}")
+
+    async def _cancel_tasks(self, tasks, label):
+        """取消任务并等待取消完成，避免插件重载后旧任务残留。"""
+        active_tasks = [task for task in tasks if task and not task.done()]
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks:
+            results = await asyncio.gather(*active_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                    logger.warning(f"[任务清理] {label} 取消时出现异常: {result}")
+
+    async def _cancel_group_runtime_tasks(self, group_id):
+        """取消指定群的成就轮询、延迟退出和一次性后台任务。"""
+        group_id = str(group_id)
+        tasks = []
+        keys_to_cancel = [key for key in self.achievement_poll_tasks if key[0] == group_id]
+        for key in keys_to_cancel:
+            task = self.achievement_poll_tasks.pop(key, None)
+            if task:
+                tasks.append(task)
+            self.achievement_snapshots.pop(key, None)
+
+        group_tasks = getattr(self, "_pending_quit_tasks", {}).pop(group_id, {})
+        for sid_tasks in group_tasks.values():
+            tasks.extend(sid_tasks.values())
+
+        fire_tasks = [
+            task for task in getattr(self, "_fire_and_forget_tasks", set())
+            if getattr(task, "_steam_monitor_key", (None, None, None))[0] == group_id
+        ]
+        for task in fire_tasks:
+            self._fire_and_forget_tasks.discard(task)
+        tasks.extend(fire_tasks)
+
+        await self._cancel_tasks(tasks, f"群 {group_id} 运行时任务")
+
+    async def _cancel_all_runtime_tasks(self):
+        """取消所有运行时异步任务（steam rs / terminate 时调用）"""
+        tasks = list(self.achievement_poll_tasks.values())
+        self.achievement_poll_tasks.clear()
+
+        if hasattr(self, '_pending_quit_tasks'):
+            for group_tasks in self._pending_quit_tasks.values():
+                for sid_tasks in group_tasks.values():
+                    tasks.extend(sid_tasks.values())
+            self._pending_quit_tasks.clear()
+
+        fire_tasks = list(getattr(self, "_fire_and_forget_tasks", set()))
+        tasks.extend(fire_tasks)
+        self._fire_and_forget_tasks.clear()
+
+        await self._cancel_tasks(tasks, "全部运行时任务")
+        self.achievement_snapshots.clear()
+
+    def _clear_group_persistent_files(self, group_ids):
+        """删除指定群的持久化状态文件，避免清理后重启回灌旧状态。"""
+        keys = ("states", "start_play_times", "last_quit_times", "pending_logs", "pending_quit", "recent_games")
+        for group_id in group_ids:
+            for key in keys:
+                path = self._get_group_data_path(group_id, key)
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        logger.warning(f"删除持久化状态文件失败: {e} path={path}")
+
+    def _create_temp_image(self, img_bytes, suffix=".png"):
+        """创建临时图片文件，返回路径（调用方需在使用后调用 _cleanup_temp_file 清理）"""
+        tmp_dir = os.path.join(self.data_dir, "tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tmp_dir) as tmp:
+            tmp.write(img_bytes)
+            return tmp.name
+
+    def _cleanup_temp_file(self, path):
+        """安全删除临时文件"""
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam rs")
     async def steam_rs(self, event: AstrMessageEvent):
         '''清除所有状态并初始化（重启插件用）'''
+        # 先取消所有运行中的异步任务，再清空数据，避免孤立任务继续访问已清空的状态
+        await self._cancel_all_runtime_tasks()
+        group_ids = list(self.group_steam_ids.keys())
+        self._clear_group_persistent_files(group_ids)
         self.group_last_states.clear()
         self.group_start_play_times.clear()
         self.group_last_quit_times.clear()
@@ -929,13 +1269,20 @@ class SteamStatusMonitorV2(Star):
         self.group_recent_games.clear()
         self._superpower_cache.clear()
         self._game_name_cache.clear()
-        self.achievement_poll_tasks.clear()
-        self.achievement_snapshots.clear()
         self.running_groups.clear()
         self.group_monitor_enabled.clear()
         self.group_achievement_enabled.clear()
+        self.group_game_filters.clear()
+        self.achievement_blacklist.clear()
+        self.achievement_fail_count.clear()
+        self.next_poll_time.clear()
+        self.push_groups.clear()
         self.notify_sessions = {}
         self._save_persistent_data()  # 清空后保存
+        self._save_achievement_toggle()  # 持久化成就开关清空状态
+        self._save_game_filters()  # 持久化过滤列表清空状态
+        self._save_notify_session()
+        self._save_push_groups()
         yield event.plain_result("Steam状态监控插件已重置，所有状态已清空。")
 
     @filter.command("steam help")
@@ -946,15 +1293,24 @@ class SteamStatusMonitorV2(Star):
             "/steam on - 启动监控\n"
             "/steam off - 停止监控\n"
             "/steam list - 列出所有玩家状态\n"
+            "/steam alllist - 列出所有群聊绑定及玩家状态\n"
             "/steam config - 查看当前配置\n"
             "/steam set [参数] [值] - 设置配置参数\n"
             "/steam addid [SteamID] - 添加SteamID\n"
             "/steam delid [SteamID] - 删除SteamID\n"
             "/steam push_group [SteamID] - 添加id到联动推送的副群\n"
             "/steam delpush_group [SteamID] - 删除id联动推送的副群\n"
+            "/steam achievement_on - 开启本群成就推送\n"
+            "/steam achievement_off - 关闭本群成就推送\n"
+            "/steam filter_add [关键词] - 添加游戏播报过滤关键词\n"
+            "/steam filter_del [关键词] - 移除游戏播报过滤关键词\n"
+            "/steam filter_list - 查看本群播报过滤列表\n"
             "/steam openbox [SteamID] - 查看指定SteamID的全部信息\n"
+            "/steam clear_allids - 删除所有群聊的全部SteamID\n"
+            "/steam clear_groupids [群号] - 删除指定群聊的全部SteamID\n"
+            "/steam 清除缓存 - 清除头像/封面图等图片缓存\n"
             "/steam rs - 清除状态并初始化\n"
-            "/steam help - 显示本帮助\n"
+            "/steam help - 显示本帮助"
         )
         yield event.plain_result(help_text)
 
@@ -973,8 +1329,10 @@ class SteamStatusMonitorV2(Star):
         '''停止Steam状态监控轮询'''
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
         self.group_monitor_enabled[group_id] = False
-        if group_id in self.running_groups:
-            self.running_groups.remove(group_id)
+        self.running_groups.discard(group_id)
+        await self._cancel_group_runtime_tasks(group_id)
+        self.notify_sessions.pop(group_id, None)
+        self._save_notify_session()
         yield event.plain_result(f"已为本群关闭Steam监控和推送。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -982,6 +1340,7 @@ class SteamStatusMonitorV2(Star):
     async def steam_achievement_on(self, event: AstrMessageEvent):
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
         self.group_achievement_enabled[group_id] = True
+        self._save_achievement_toggle()
         yield event.plain_result(f"已为本群开启Steam成就推送。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -989,6 +1348,7 @@ class SteamStatusMonitorV2(Star):
     async def steam_achievement_off(self, event: AstrMessageEvent):
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
         self.group_achievement_enabled[group_id] = False
+        self._save_achievement_toggle()
         yield event.plain_result(f"已为本群关闭Steam成就推送。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1010,10 +1370,11 @@ class SteamStatusMonitorV2(Star):
         # 直接测试 Pillow 渲染
         try:
             img_bytes = await self.achievement_monitor.render_achievement_image(details, unlocked, player_name=player_name, font_path=font_path)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                tmp.write(img_bytes)
-                tmp_path = tmp.name
-            yield event.image_result(tmp_path)
+            tmp_path = self._create_temp_image(img_bytes)
+            try:
+                yield event.image_result(tmp_path)
+            finally:
+                self._cleanup_temp_file(tmp_path)
         except Exception as e:
             import traceback
             logger.error(f"成就图片渲染失败: {e}\n{traceback.format_exc()}")
@@ -1040,17 +1401,19 @@ class SteamStatusMonitorV2(Star):
             )
             logger.info(f"[测试开始游戏渲染] render_game_start 返回类型: {type(img_bytes)} 长度: {len(img_bytes) if img_bytes else 'None'}")
             if img_bytes:
-                import tempfile
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                    tmp.write(img_bytes)
-                    tmp_path = tmp.name
+                tmp_path = self._create_temp_image(img_bytes)
                 img = PILImage.open(tmp_path).convert("RGB")
-                cropped_img = self.crop_image_auto(img, bg_color=(51,81,66), threshold=15)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp2:
-                    cropped_img.save(tmp2, format="PNG")
-                    tmp_path = tmp2.name
+                cropped_img = await self.crop_image_auto(img, bg_color=(51,81,66), threshold=15)
+                self._cleanup_temp_file(tmp_path)
+                import io as _io
+                buf = _io.BytesIO()
+                cropped_img.save(buf, format="PNG")
+                tmp_path = self._create_temp_image(buf.getvalue())
                 logger.info(f"[测试开始游戏渲染] 已保存裁剪图到 {tmp_path}")
-                yield event.image_result(tmp_path)
+                try:
+                    yield event.image_result(tmp_path)
+                finally:
+                    self._cleanup_temp_file(tmp_path)
             else:
                 yield event.plain_result("渲染失败，未获取到图片数据。")
         except Exception as e:
@@ -1102,12 +1465,12 @@ class SteamStatusMonitorV2(Star):
                 end_time_str, tip_text, duration_h, sgdb_api_key=self.SGDB_API_KEY, font_path=font_path, sgdb_game_name=en_game_name, appid=gameid, sgdb_api_base=self.SGDB_API_BASE
             )
             msg = f"👋 {player_name} 不玩 {zh_game_name} 了\n游玩时间 {duration_h:.1f}小时"
-            import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                tmp.write(img_bytes)
-                tmp_path = tmp.name
-            yield event.plain_result(msg)
-            yield event.image_result(tmp_path)
+            tmp_path = self._create_temp_image(img_bytes)
+            try:
+                yield event.plain_result(msg)
+                yield event.image_result(tmp_path)
+            finally:
+                self._cleanup_temp_file(tmp_path)
         except Exception as e:
             import traceback
             logger.error(f"测试游戏结束图片渲染失败: {e}\n{traceback.format_exc()}")
@@ -1137,6 +1500,9 @@ class SteamStatusMonitorV2(Star):
     @filter.command("steam clear_allids")
     async def steam_clear_allids(self, event: AstrMessageEvent):
         '''删除所有群聊的所有已监控SteamID，并清空相关状态数据'''
+        await self._cancel_all_runtime_tasks()
+        group_ids = list(self.group_steam_ids.keys())
+        self._clear_group_persistent_files(group_ids)
         self.group_steam_ids.clear()
         self._save_group_steam_ids()  # 新增：保存到 steam_groups.json
         self.group_last_states.clear()
@@ -1145,7 +1511,18 @@ class SteamStatusMonitorV2(Star):
         self.group_pending_logs.clear()
         self.group_pending_quit.clear()
         self.group_recent_games.clear()
+        self.group_game_filters.clear()
+        self.group_achievement_enabled.clear()
+        self.running_groups.clear()
+        self.group_monitor_enabled.clear()
+        self.next_poll_time.clear()
+        self.notify_sessions = {}
+        self.push_groups.clear()
+        self._save_game_filters()
+        self._save_achievement_toggle()
         self._save_persistent_data()
+        self._save_notify_session()
+        self._save_push_groups()
         self.config['group_steam_ids'] = self.group_steam_ids
         if hasattr(self.config, "save_config"):
             self.config.save_config()
@@ -1158,6 +1535,8 @@ class SteamStatusMonitorV2(Star):
         if group_id not in self.group_steam_ids:
             yield event.plain_result(f"群聊 {group_id} 未绑定任何SteamID，无需清理。")
             return
+        await self._cancel_group_runtime_tasks(group_id)
+        self._clear_group_persistent_files([group_id])
         self.group_steam_ids.pop(group_id, None)
         self._save_group_steam_ids()  # 保存到 steam_groups.json
         self.group_last_states.pop(group_id, None)
@@ -1166,79 +1545,121 @@ class SteamStatusMonitorV2(Star):
         self.group_pending_logs.pop(group_id, None)
         self.group_pending_quit.pop(group_id, None)
         self.group_recent_games.pop(group_id, None)
+        self.group_game_filters.pop(group_id, None)
+        self.group_achievement_enabled.pop(group_id, None)
+        self.running_groups.discard(group_id)
+        self.group_monitor_enabled.pop(group_id, None)
+        self.next_poll_time.pop(group_id, None)
+        for sid, push_group_ids in list(self.push_groups.items()):
+            self.push_groups[sid] = [gid for gid in push_group_ids if gid != group_id]
+            if not self.push_groups[sid]:
+                self.push_groups.pop(sid, None)
+        self._save_game_filters()
+        self._save_achievement_toggle()
         self._save_persistent_data()
         self.notify_sessions.pop(group_id, None)
+        self._save_notify_session()
+        self._save_push_groups()
+        self.config['group_steam_ids'] = self.group_steam_ids
         if hasattr(self.config, "save_config"):
             self.config.save_config()
         yield event.plain_result(f"已删除群聊 {group_id} 的所有SteamID，相关状态数据已清空。")
 
     async def _delayed_quit_check(self, group_id, sid, gameid):
-        await asyncio.sleep(180)
-        info = self.group_pending_quit.get(sid, {}).get(gameid)
-        if info and not info.get("notified"):
-            duration_min = info["duration_min"]
-            if duration_min == 0:
-                for _ in range(2):
-                    last_quit_time = info["quit_time"]
-                    start_time = info["start_time"]
-                    if start_time and last_quit_time:
-                        duration_min = (last_quit_time - start_time) / 60
-                        if duration_min > 0:
-                            info["duration_min"] = duration_min
-                            break
-                    await asyncio.sleep(1)
-            info["notified"] = True
-            duration_min = info["duration_min"]
-            if duration_min < 60:
-                time_str = f"{duration_min:.1f}分钟"
-            else:
-                time_str = f"{duration_min/60:.1f}小时"
-            msg = f"👋 {info['name']} 不玩 {info['game_name']}了\n游玩时间 {time_str}"
-            # 推送到主群和所有联动群
-            notify_sessions = []
-            notify_session = getattr(self, 'notify_sessions', {}).get(group_id, None)
-            if notify_session:
-                notify_sessions.append(notify_session)
-            for push_gid in self.push_groups.get(sid, []):
-                push_session = getattr(self, 'notify_sessions', {}).get(push_gid, None)
-                if push_session and push_session not in notify_sessions:
-                    notify_sessions.append(push_session)
-            for session in notify_sessions:
-                try:
-                    from datetime import datetime
-                    end_time_str = datetime.fromtimestamp(info["quit_time"]).strftime("%Y-%m-%d %H:%M")
-                    duration_h = info["duration_min"] / 60 if info["duration_min"] > 0 else 0
-                    avatar_url = None
-                    last_state = self.group_last_states.get(group_id, {}).get(sid)
-                    if last_state:
-                        avatar_url = last_state.get("avatarfull") or last_state.get("avatar")
-                    if not avatar_url:
-                        status_full = await self.fetch_player_status(sid)
-                        if status_full:
-                            avatar_url = status_full.get("avatarfull") or status_full.get("avatar")
-                    tip_text = info.get("tip_text") or "你已经和椅子合为一体，成为传说中的‘椅子精’了喵！"
-                    zh_game_name, en_game_name = await self.get_game_names(gameid, info["game_name"])
-                    font_path = self.get_font_path('NotoSansHans-Regular.otf')
-                    img_bytes = await render_game_end(
-                        self.data_dir, sid, info["name"], avatar_url, gameid, zh_game_name,
-                        end_time_str, tip_text, duration_h, sgdb_api_key=self.SGDB_API_KEY, font_path=font_path, sgdb_game_name=en_game_name, appid=gameid, sgdb_api_base=self.SGDB_API_BASE
-                    )
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                        tmp.write(img_bytes)
-                        tmp_path = tmp.name
-                    await self.context.send_message(session, MessageChain([Plain(msg), Image.fromFileSystem(tmp_path)]))
-                except Exception as e:
-                    logger.error(f"推送游戏结束图片失败: {e}")
-                    await self.context.send_message(session, MessageChain([Plain(msg)]))
-            # 三分钟后再关闭成就轮询和清理快照
-            key = (group_id, sid, gameid)
-            poll_task = self.achievement_poll_tasks.pop(key, None)
-            if poll_task:
-                poll_task.cancel()
-            self.achievement_snapshots.pop(key, None)
-            self.achievement_monitor.clear_game_achievements(group_id, sid, gameid)
-            self.group_pending_quit[sid].pop(gameid, None)
+        try:
+            await asyncio.sleep(180)
+            # 游戏播报过滤检查
+            info = self.group_pending_quit.get(group_id, {}).get(sid, {}).get(gameid)
+            if not info:
+                return
+            if self._is_game_filtered(group_id, info.get("game_name", "")):
+                logger.info(f"[播报过滤] {info.get('name', sid)} 退出的游戏「{info.get('game_name', '')}」在过滤列表中，跳过推送")
+                info["notified"] = True
+                # 清理成就轮询
+                key = (group_id, sid, gameid)
+                poll_task = self.achievement_poll_tasks.pop(key, None)
+                if poll_task:
+                    poll_task.cancel()
+                self.achievement_snapshots.pop(key, None)
+                self.achievement_monitor.clear_game_achievements(group_id, sid, gameid)
+                if sid in self.group_pending_quit.get(group_id, {}):
+                    self.group_pending_quit[group_id][sid].pop(gameid, None)
+                # 清理延迟任务引用
+                if hasattr(self, '_pending_quit_tasks'):
+                    self._pending_quit_tasks.get(group_id, {}).get(sid, {}).pop(gameid, None)
+                return
+            if not info.get("notified"):
+                duration_min = info["duration_min"]
+                if duration_min == 0:
+                    for _ in range(2):
+                        last_quit_time = info["quit_time"]
+                        start_time = info["start_time"]
+                        if start_time and last_quit_time:
+                            duration_min = (last_quit_time - start_time) / 60
+                            if duration_min > 0:
+                                info["duration_min"] = duration_min
+                                break
+                        await asyncio.sleep(1)
+                info["notified"] = True
+                duration_min = info["duration_min"]
+                if duration_min < 60:
+                    time_str = f"{duration_min:.1f}分钟"
+                else:
+                    time_str = f"{duration_min/60:.1f}小时"
+                msg = f"👋 {info['name']} 不玩 {info['game_name']}了\n游玩时间 {time_str}"
+                # 推送到主群和所有联动群
+                notify_sessions = []
+                notify_session = getattr(self, 'notify_sessions', {}).get(group_id, None)
+                if notify_session:
+                    notify_sessions.append(notify_session)
+                for push_gid in self.push_groups.get(sid, []):
+                    push_session = getattr(self, 'notify_sessions', {}).get(push_gid, None)
+                    if push_session and push_session not in notify_sessions:
+                        notify_sessions.append(push_session)
+                for session in notify_sessions:
+                    tmp_path = None
+                    try:
+                        from datetime import datetime
+                        end_time_str = datetime.fromtimestamp(info["quit_time"]).strftime("%Y-%m-%d %H:%M")
+                        duration_h = info["duration_min"] / 60 if info["duration_min"] > 0 else 0
+                        avatar_url = None
+                        last_state = self.group_last_states.get(group_id, {}).get(sid)
+                        if last_state:
+                            avatar_url = last_state.get("avatarfull") or last_state.get("avatar")
+                        if not avatar_url:
+                            status_full = await self.fetch_player_status(sid)
+                            if status_full:
+                                avatar_url = status_full.get("avatarfull") or status_full.get("avatar")
+                        tip_text = info.get("tip_text") or "你已经和椅子合为一体，成为传说中的'椅子精'了喵！"
+                        zh_game_name, en_game_name = await self.get_game_names(gameid, info["game_name"])
+                        font_path = self.get_font_path('NotoSansHans-Regular.otf')
+                        img_bytes = await render_game_end(
+                            self.data_dir, sid, info["name"], avatar_url, gameid, zh_game_name,
+                            end_time_str, tip_text, duration_h, sgdb_api_key=self.SGDB_API_KEY, font_path=font_path, sgdb_game_name=en_game_name, appid=gameid, sgdb_api_base=self.SGDB_API_BASE
+                        )
+                        tmp_path = self._create_temp_image(img_bytes)
+                        await self.context.send_message(session, MessageChain([Plain(msg), Image.fromFileSystem(tmp_path)]))
+                    except Exception as e:
+                        logger.error(f"推送游戏结束图片失败: {e}")
+                        await self.context.send_message(session, MessageChain([Plain(msg)]))
+                    finally:
+                        self._cleanup_temp_file(tmp_path)
+                # 三分钟后再关闭成就轮询和清理快照
+                key = (group_id, sid, gameid)
+                poll_task = self.achievement_poll_tasks.pop(key, None)
+                if poll_task:
+                    poll_task.cancel()
+                self.achievement_snapshots.pop(key, None)
+                self.achievement_monitor.clear_game_achievements(group_id, sid, gameid)
+                self.group_pending_quit.get(group_id, {}).get(sid, {}).pop(gameid, None)
+        except asyncio.CancelledError:
+            logger.info(f"[延迟退出] 任务已取消 group_id={group_id} sid={sid} gameid={gameid}")
+            raise
+        except Exception as e:
+            logger.error(f"[延迟退出] group_id={group_id} sid={sid} gameid={gameid} 异常: {e}\n{traceback.format_exc()}")
+        finally:
+            if hasattr(self, '_pending_quit_tasks'):
+                self._pending_quit_tasks.get(group_id, {}).get(sid, {}).pop(gameid, None)
 
     async def check_status_change(self, group_id, single_sid=None, status_override=None, poll_level=None):
         '''轮询检测玩家状态变更并推送通知（分群，支持单个sid）
@@ -1290,7 +1711,7 @@ class SteamStatusMonitorV2(Star):
                     "start_time": start_time,
                     "notified": False
                 }
-                # 成就结算：游戏结束时，延迟15分钟再做一次对比
+                # 成就结算：游戏结束时，延迟15分钟再做一次对比（仅在成就监控曾启动时执行）
                 try:
                     player_name = name
                     game_name = zh_prev_game_name
@@ -1298,19 +1719,25 @@ class SteamStatusMonitorV2(Star):
                     poll_task = self.achievement_poll_tasks.pop(key, None)
                     if poll_task:
                         poll_task.cancel()
-                    asyncio.create_task(self.achievement_delayed_final_check(group_id, sid, prev_gameid, player_name, game_name))
+                    if key in self.achievement_snapshots:
+                        _final_task = asyncio.create_task(self.achievement_delayed_final_check(group_id, sid, prev_gameid, player_name, game_name))
+                        _final_task._steam_monitor_key = key
+                        self._fire_and_forget_tasks.add(_final_task)
+                        _final_task.add_done_callback(self._fire_and_forget_tasks.discard)
                 except Exception as e:
                     logger.error(f"结算成就时异常: {e}")
                 # 启动延迟任务
                 if not hasattr(self, '_pending_quit_tasks'):
                     self._pending_quit_tasks = {}
-                if sid not in self._pending_quit_tasks:
-                    self._pending_quit_tasks[sid] = {}
-                old_task = self._pending_quit_tasks[sid].get(prev_gameid)
+                if group_id not in self._pending_quit_tasks:
+                    self._pending_quit_tasks[group_id] = {}
+                if sid not in self._pending_quit_tasks[group_id]:
+                    self._pending_quit_tasks[group_id][sid] = {}
+                old_task = self._pending_quit_tasks[group_id][sid].get(prev_gameid)
                 if old_task:
                     old_task.cancel()
                 task = asyncio.create_task(self._delayed_quit_check(group_id, sid, prev_gameid))
-                self._pending_quit_tasks[sid][prev_gameid] = task
+                self._pending_quit_tasks[group_id][sid][prev_gameid] = task
                 last_quit_times.setdefault(sid, {})[prev_gameid] = now
                 last_states[sid] = status
                 continue  # 防止重复推送
@@ -1321,10 +1748,15 @@ class SteamStatusMonitorV2(Star):
                 # 检查是否为网络波动（3分钟内重启同一游戏）
                 if quit_info and now - quit_info["quit_time"] <= 180 and not quit_info.get("notified"):
                     # 取消延迟任务
-                    if hasattr(self, '_pending_quit_tasks') and self._pending_quit_tasks.get(sid, {}).get(current_gameid):
-                        self._pending_quit_tasks[sid][current_gameid].cancel()
-                        self._pending_quit_tasks[sid].pop(current_gameid, None)
+                    if hasattr(self, '_pending_quit_tasks') and self._pending_quit_tasks.get(group_id, {}).get(sid, {}).get(current_gameid):
+                        self._pending_quit_tasks[group_id][sid][current_gameid].cancel()
+                        self._pending_quit_tasks[group_id][sid].pop(current_gameid, None)
                     quit_info["notified"] = True
+                    # 游戏播报过滤检查
+                    if self._is_game_filtered(group_id, zh_game_name):
+                        logger.info(f"[播报过滤] {name} 网络波动的游戏「{zh_game_name}」在过滤列表中，跳过推送")
+                        last_states[sid] = status
+                        continue
                     msg = f"⚠️ {name} 游玩 {zh_game_name} 时网络波动了"
                     # 推送到主群和所有联动群
                     notify_sessions = []
@@ -1341,6 +1773,11 @@ class SteamStatusMonitorV2(Star):
                     continue  # 只推送网络波动提醒，跳过后续逻辑
                 # 修复：补充开始游戏推送逻辑
                 start_play_times.setdefault(sid, {})[current_gameid] = now
+                # 游戏播报过滤检查
+                if self._is_game_filtered(group_id, zh_game_name):
+                    logger.info(f"[播报过滤] {name} 开始的游戏「{zh_game_name}」在过滤列表中，跳过推送")
+                    last_states[sid] = status
+                    continue
                 msg = f"🟢【{name}】开始游玩 {zh_game_name}"
                 # 推送到主群和所有push_group
                 notify_sessions = []
@@ -1364,49 +1801,54 @@ class SteamStatusMonitorV2(Star):
                         api_key=self.API_KEY, superpower=superpower, sgdb_api_key=self.SGDB_API_KEY,
                         font_path=font_path, sgdb_game_name=en_game_name, online_count=online_count, appid=gameid, sgdb_api_base=self.SGDB_API_BASE, steam_api_base=self.STEAM_API_BASE
                     )
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                        tmp.write(img_bytes)
-                        img_path = tmp.name
+                    img_path = self._create_temp_image(img_bytes)
                 except Exception as e:
                     logger.error(f"推送开始游戏图片失败: {e}")
                     img_path = None
-                for session in notify_sessions:
-                    try:
-                        msg_chain = [Plain(f"🟢【{name}】开始游玩 {zh_game_name}")]
-                        if img_path:
-                            msg_chain.append(Image.fromFileSystem(img_path))
-                        await self.context.send_message(session, MessageChain(msg_chain))
-                    except Exception as e:
-                        logger.error(f"推送开始游戏消息失败: {e}")
-                # 成就监控任务启动
                 try:
-                    player_name = name
-                    game_name = zh_game_name
-                    key = (group_id, sid, current_gameid)
-                    achievements = await self.achievement_monitor.get_player_achievements(self.API_KEY, group_id, sid, current_gameid)
-                    self.achievement_snapshots[key] = list(achievements) if achievements else []
-                    # 新增日志：已成功获取成就列表
-                    unlocked_count = len(achievements) if achievements else 0
-                    # 获取总成就数量
-                    details = await self.achievement_monitor.get_achievement_details(group_id, current_gameid, lang="schinese", api_key=self.API_KEY, steamid=sid)
-                    total_count = len(details) if details else 0
-                    logger.info(f"[成就初始化] {name} 已成功获取成就列表 {unlocked_count}/{total_count} 游戏名：{zh_game_name}")
-                    poll_task = asyncio.create_task(self.achievement_periodic_check(group_id, sid, current_gameid, player_name, game_name))
-                    self.achievement_poll_tasks[key] = poll_task
-                except Exception as e:
-                    logger.error(f"启动成就监控任务异常: {e}")
+                    for session in notify_sessions:
+                        try:
+                            msg_chain = [Plain(f"🟢【{name}】开始游玩 {zh_game_name}")]
+                            if img_path:
+                                msg_chain.append(Image.fromFileSystem(img_path))
+                            await self.context.send_message(session, MessageChain(msg_chain))
+                        except Exception as e:
+                            logger.error(f"推送开始游戏消息失败: {e}")
+                finally:
+                    self._cleanup_temp_file(img_path)
+                # 成就监控任务启动（仅在成就推送开启时启动，节省 API 调用）
+                if self.group_achievement_enabled.get(group_id, self._achievement_default):
+                    try:
+                        player_name = name
+                        game_name = zh_game_name
+                        key = (group_id, sid, current_gameid)
+                        achievements = await self.achievement_monitor.get_player_achievements(self.API_KEY, group_id, sid, current_gameid)
+                        self.achievement_snapshots[key] = list(achievements) if achievements else []
+                        # 新增日志：已成功获取成就列表
+                        unlocked_count = len(achievements) if achievements else 0
+                        # 获取总成就数量
+                        details = await self.achievement_monitor.get_achievement_details(group_id, current_gameid, lang="schinese", api_key=self.API_KEY, steamid=sid)
+                        total_count = len(details) if details else 0
+                        logger.info(f"[成就初始化] {name} 已成功获取成就列表 {unlocked_count}/{total_count} 游戏名：{zh_game_name}")
+                        poll_task = asyncio.create_task(self.achievement_periodic_check(group_id, sid, current_gameid, player_name, game_name))
+                        self.achievement_poll_tasks[key] = poll_task
+                    except Exception as e:
+                        logger.error(f"启动成就监控任务异常: {e}")
+                else:
+                    logger.info(f"[成就监控] 本群成就推送已关闭，跳过 {name} 的成就监控任务")
                 last_states[sid] = status
                 continue
 
             # 智能轮询间隔设置（支持固定间隔）
             next_poll = self.next_poll_time.setdefault(group_id, {})
-            import math
+            intervals = self.smart_poll_intervals if isinstance(self.smart_poll_intervals, list) and len(self.smart_poll_intervals) == 6 else [1, 3, 5, 10, 20, 30]
             if self.fixed_poll_interval and self.fixed_poll_interval > 0:
-                poll_interval = self.fixed_poll_interval
-                poll_level_str = f"固定{self.fixed_poll_interval//60 if self.fixed_poll_interval>=60 else self.fixed_poll_interval}秒轮询"
+                poll_interval = max(1, int(self.fixed_poll_interval))
+                if poll_interval >= 60 and poll_interval % 60 == 0:
+                    poll_level_str = f"固定{poll_interval // 60}分钟轮询"
+                else:
+                    poll_level_str = f"固定{poll_interval}秒轮询"
             else:
-                intervals = self.smart_poll_intervals if isinstance(self.smart_poll_intervals, list) and len(self.smart_poll_intervals) == 6 else [1, 3, 5, 10, 20, 30]
                 # 优先级：游戏中 > 在线 > 离线 > 默认
                 if gameid:
                     poll_interval = intervals[0] * 60
@@ -1434,10 +1876,13 @@ class SteamStatusMonitorV2(Star):
                 else:
                     poll_interval = intervals[5] * 60
                     poll_level_str = f"{intervals[5]}分钟轮询"
-            interval_min = poll_interval // 60
-            next_time = ((now // 60) + math.ceil(interval_min)) * 60
-            if interval_min in [intervals[1], intervals[2], intervals[3], intervals[4], intervals[5]]:
-                next_time = ((now // 60) // interval_min + 1) * interval_min * 60
+            if self.fixed_poll_interval and self.fixed_poll_interval > 0:
+                next_time = now + poll_interval
+            else:
+                interval_min = max(1, poll_interval // 60)
+                next_time = ((now // 60) + math.ceil(interval_min)) * 60
+                if interval_min in [intervals[1], intervals[2], intervals[3], intervals[4], intervals[5]]:
+                    next_time = ((now // 60) // interval_min + 1) * interval_min * 60
             next_poll[sid] = next_time
             # 轮询间隔描述
             if gameid:
@@ -1455,6 +1900,20 @@ class SteamStatusMonitorV2(Star):
             for gameid in list(pending_quit[sid].keys()):
                 info = pending_quit[sid][gameid]
                 if now - info["quit_time"] >= 180 and not info.get("notified"):
+                    # 游戏播报过滤检查
+                    if self._is_game_filtered(group_id, info.get("game_name", "")):
+                        logger.info(f"[播报过滤] {info.get('name', sid)} 退出的游戏「{info.get('game_name', '')}」在过滤列表中，跳过推送")
+                        info["notified"] = True
+                        # 清理成就轮询
+                        key = (group_id, sid, gameid)
+                        poll_task = self.achievement_poll_tasks.pop(key, None)
+                        if poll_task:
+                            poll_task.cancel()
+                        self.achievement_snapshots.pop(key, None)
+                        self.achievement_monitor.clear_game_achievements(group_id, sid, gameid)
+                        if gameid in pending_quit[sid]:
+                            del pending_quit[sid][gameid]
+                        continue
                     info["notified"] = True
                     duration_min = info.get("duration_min", 0)
                     # 优化时间显示
@@ -1474,6 +1933,7 @@ class SteamStatusMonitorV2(Star):
                             if push_session and push_session not in notify_sessions:
                                 notify_sessions.append(push_session)
                         if notify_sessions:
+                            tmp_path = None
                             try:
                                 from datetime import datetime
                                 end_time_str = datetime.fromtimestamp(info["quit_time"]).strftime("%Y-%m-%d %H:%M")
@@ -1514,16 +1974,15 @@ class SteamStatusMonitorV2(Star):
                                     self.data_dir, sid, info["name"], avatar_url, gameid, zh_game_name,
                                     end_time_str, tip_text, duration_min/60 if duration_min > 0 else 0, sgdb_api_key=self.SGDB_API_KEY, font_path=font_path, sgdb_game_name=en_game_name, appid=gameid, sgdb_api_base=self.SGDB_API_BASE
                                 )
-                                import tempfile
-                                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                                    tmp.write(img_bytes)
-                                    tmp_path = tmp.name
+                                tmp_path = self._create_temp_image(img_bytes)
                                 for session in notify_sessions:
                                     await self.context.send_message(session, MessageChain([Plain(msg), Image.fromFileSystem(tmp_path)]))
                             except Exception as e:
                                 logger.error(f"推送游戏结束图片失败: {e}")
                                 for session in notify_sessions:
                                     await self.context.send_message(session, MessageChain([Plain(msg)]))
+                            finally:
+                                self._cleanup_temp_file(tmp_path)
                         else:
                             logger.error("未设置推送会话，无法发送消息")
                     except Exception as e:
@@ -1623,6 +2082,49 @@ class SteamStatusMonitorV2(Star):
             yield event.plain_result(f"本群已加入SteamID {steamid} 的联动推送组。")
         else:
             yield event.plain_result("本群已在该SteamID的推送组中。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("steam filter_add")
+    async def steam_filter_add(self, event: AstrMessageEvent, game_name: str):
+        '''添加游戏名关键词到本群播报过滤列表（模糊匹配，不区分大小写）'''
+        group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
+        game_name = game_name.strip()
+        if not game_name:
+            yield event.plain_result("过滤关键词不能为空。")
+            return
+        filters = self.group_game_filters.setdefault(group_id, [])
+        if game_name.lower() in {kw.lower() for kw in filters}:
+            yield event.plain_result(f"「{game_name}」已在过滤列表中。")
+            return
+        filters.append(game_name)
+        self._save_game_filters()
+        yield event.plain_result(f"已将「{game_name}」添加到本群播报过滤列表。\n当前过滤列表：{', '.join(filters)}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("steam filter_del")
+    async def steam_filter_del(self, event: AstrMessageEvent, game_name: str):
+        '''从本群播报过滤列表移除游戏名关键词'''
+        group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
+        game_name = game_name.strip()
+        filters = self.group_game_filters.get(group_id, [])
+        next_filters = [kw for kw in filters if kw.lower() != game_name.lower()]
+        if len(next_filters) == len(filters):
+            yield event.plain_result(f"「{game_name}」不在过滤列表中。")
+            return
+        self.group_game_filters[group_id] = next_filters
+        self._save_game_filters()
+        yield event.plain_result(f"已从本群过滤列表移除「{game_name}」。\n当前过滤列表：{', '.join(next_filters) or '空'}")
+
+    @filter.command("steam filter_list")
+    async def steam_filter_list(self, event: AstrMessageEvent):
+        '''查看本群播报过滤列表'''
+        group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
+        filters = self.group_game_filters.get(group_id, [])
+        global_filters = getattr(self, "_global_game_filters", [])
+        lines = []
+        lines.append("全局播报过滤列表：" + (", ".join(global_filters) if global_filters else "空"))
+        lines.append("本群播报过滤列表：" + (", ".join(filters) if filters else "空"))
+        yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam delpush_group")
