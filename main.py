@@ -411,6 +411,27 @@ class SteamStatusMonitorF(Star):
         except Exception as e:
             logger.warning(f"[生命周期] 后台任务结束时出现异常: {e}")
 
+    @staticmethod
+    def _is_empty_gameid(gameid):
+        return gameid in (None, "", "0", 0)
+
+    def _ensure_start_play_time_map(self, start_play_times, sid, gameid=None):
+        """兼容旧版 start_play_times 的整数格式，统一为按游戏记录的字典。"""
+        current = start_play_times.get(sid)
+        if isinstance(current, dict):
+            return current
+
+        converted = {}
+        if current and not self._is_empty_gameid(gameid):
+            try:
+                converted[gameid] = int(current)
+            except (TypeError, ValueError):
+                converted[gameid] = int(time.time())
+        if current is not None:
+            logger.info(f"[状态迁移] 已转换 SteamID {sid} 的 start_play_times 旧格式")
+        start_play_times[sid] = converted
+        return converted
+
     def _register_active_instance(self):
         """记录当前插件实例，并在重载时终止旧实例任务。"""
         old_instance = getattr(builtins, _ACTIVE_INSTANCE_ATTR, None)
@@ -437,7 +458,7 @@ class SteamStatusMonitorF(Star):
         # 分群管理：所有状态数据均以 group_id 为 key
         self.group_steam_ids = {}         # {group_id: [steamid, ...]}
         self.group_last_states = {}       # {group_id: {steamid: status}}
-        self.group_start_play_times = {}  # {group_id: {steamid: start_time}}
+        self.group_start_play_times = {}  # {group_id: {steamid: {gameid: start_time}}}
         self.group_last_quit_times = {}   # {group_id: {steamid: {gameid: quit_time}}}
         self.group_pending_logs = {}      # {group_id: {steamid: {gameid: log_dict}}}
         self.group_recent_games = {}      # {group_id: [gameid, ...]}
@@ -503,6 +524,7 @@ class SteamStatusMonitorF(Star):
         # --- 新增：重启后自动推送 ---
         self.running_groups = set()  # 正在运行的群号集合
         self.group_monitor_enabled = {}      # {group_id: bool} 监控开关
+        self._steam_on_synced_groups = set()  # 本次运行中已由 /steam on 同步过当前状态的群
         # group_achievement_enabled 已由 _load_achievement_toggle() 加载，此处不再覆盖
         # --- 新增：重启后自动恢复所有群的轮询 ---
         if hasattr(self, 'notify_sessions') and self.notify_sessions and self.API_KEY and self.group_steam_ids:
@@ -983,32 +1005,61 @@ class SteamStatusMonitorF(Star):
                 "或使用 /steam addid [SteamID] 添加要监控的玩家。"
             )
             return
-        if group_id in self.running_groups:
-            yield event.plain_result("本群Steam监控已在运行。")
-            return
-        self.running_groups.add(group_id)
+        already_running = group_id in self.running_groups
         if not hasattr(self, 'notify_sessions'):
             self.notify_sessions = {}
-        self.notify_sessions[group_id] = event.unified_msg_origin
+        previous_notify_session = self.notify_sessions.get(group_id)
+        current_notify_session = event.unified_msg_origin
+        session_changed = previous_notify_session != current_notify_session
+        self.running_groups.add(group_id)
+        self.notify_sessions[group_id] = current_notify_session
         self._save_notify_session()
-        # 初始化状态
+        # 初始化状态，并在首次开启或修复缺失会话时补发当前正在游戏的开始播报。
         now = int(time.time())
         if group_id not in self.group_last_states:
             self.group_last_states[group_id] = {}
         if group_id not in self.group_start_play_times:
             self.group_start_play_times[group_id] = {}
+        initial_push_count = 0
         for sid in steam_ids:
             status = await self.fetch_player_status(sid)
-            if status:
-                self.group_last_states[group_id][sid] = status
-                if status.get('gameid'):
-                    prev = self.group_last_states[group_id].get(sid)
-                    prev_gameid = prev.get('gameid') if prev else None
-                    if prev_gameid and prev_gameid == status.get('gameid') and sid in self.group_start_play_times[group_id]:
-                        pass
-                    else:
-                        self.group_start_play_times[group_id][sid] = int(time.time())
-        yield event.plain_result("本群Steam状态监控启动完成喔！ヾ(≧ω≦)ゞ")
+            if not status:
+                continue
+            prev = self.group_last_states[group_id].get(sid)
+            prev_gameid = prev.get('gameid') if prev else None
+            current_gameid = status.get('gameid')
+            should_push_initial = (
+                not self._is_empty_gameid(current_gameid)
+                and (
+                    group_id not in self._steam_on_synced_groups
+                    or self._is_empty_gameid(prev_gameid)
+                    or prev_gameid != current_gameid
+                    or not previous_notify_session
+                    or session_changed
+                )
+            )
+            if should_push_initial:
+                if prev_gameid == current_gameid:
+                    self.group_last_states[group_id].pop(sid, None)
+                await self.check_status_change(group_id, single_sid=sid, status_override=status)
+                initial_push_count += 1
+                continue
+
+            self.group_last_states[group_id][sid] = status
+            if not self._is_empty_gameid(current_gameid):
+                start_times = self._ensure_start_play_time_map(
+                    self.group_start_play_times[group_id],
+                    sid,
+                    current_gameid
+                )
+                if prev_gameid != current_gameid or current_gameid not in start_times:
+                    start_times[current_gameid] = now
+        self._steam_on_synced_groups.add(group_id)
+        self._save_persistent_data()
+        result = "本群Steam监控已在运行，已刷新推送会话。" if already_running else "本群Steam状态监控启动完成。"
+        if initial_push_count:
+            result += f"\n已同步处理 {initial_push_count} 个当前游戏状态。"
+        yield event.plain_result(result)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam addid")
@@ -1271,6 +1322,7 @@ class SteamStatusMonitorF(Star):
         self._game_name_cache.clear()
         self.running_groups.clear()
         self.group_monitor_enabled.clear()
+        self._steam_on_synced_groups.clear()
         self.group_achievement_enabled.clear()
         self.group_game_filters.clear()
         self.achievement_blacklist.clear()
@@ -1330,6 +1382,7 @@ class SteamStatusMonitorF(Star):
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
         self.group_monitor_enabled[group_id] = False
         self.running_groups.discard(group_id)
+        self._steam_on_synced_groups.discard(group_id)
         await self._cancel_group_runtime_tasks(group_id)
         self.notify_sessions.pop(group_id, None)
         self._save_notify_session()
@@ -1514,6 +1567,7 @@ class SteamStatusMonitorF(Star):
         self.group_game_filters.clear()
         self.group_achievement_enabled.clear()
         self.running_groups.clear()
+        self._steam_on_synced_groups.clear()
         self.group_monitor_enabled.clear()
         self.next_poll_time.clear()
         self.notify_sessions = {}
@@ -1548,6 +1602,7 @@ class SteamStatusMonitorF(Star):
         self.group_game_filters.pop(group_id, None)
         self.group_achievement_enabled.pop(group_id, None)
         self.running_groups.discard(group_id)
+        self._steam_on_synced_groups.discard(group_id)
         self.group_monitor_enabled.pop(group_id, None)
         self.next_poll_time.pop(group_id, None)
         for sid, push_group_ids in list(self.push_groups.items()):
@@ -1688,16 +1743,17 @@ class SteamStatusMonitorF(Star):
             prev_gameid = prev.get('gameid') if prev else None
             current_gameid = gameid
             # --- 退出游戏（缓冲3分钟） ---
-            if prev_gameid and current_gameid in [None, "", "0"]:
+            if not self._is_empty_gameid(prev_gameid) and self._is_empty_gameid(current_gameid):
                 logger.info(f"[退出逻辑] {name} prev_gameid={prev_gameid} current_gameid={current_gameid}")
                 zh_prev_game_name = await self.get_chinese_game_name(prev_gameid, prev.get('gameextrainfo') if prev else None) if prev_gameid else (prev.get('gameextrainfo') if prev else "未知游戏")
                 duration_min = 0
-                start_time = start_play_times.setdefault(sid, {}).get(prev_gameid, now)
-                if prev_gameid in start_play_times.get(sid, {}):
-                    duration_min = (now - start_play_times[sid][prev_gameid]) / 60
+                sid_start_times = self._ensure_start_play_time_map(start_play_times, sid, prev_gameid)
+                start_time = sid_start_times.get(prev_gameid, now)
+                if prev_gameid in sid_start_times:
+                    duration_min = (now - sid_start_times[prev_gameid]) / 60
                     if duration_min == 0:
                         for _ in range(2):
-                            start_time = start_play_times[sid].get(prev_gameid, now)
+                            start_time = sid_start_times.get(prev_gameid, now)
                             duration_min = (now - start_time) / 60
                             if duration_min > 0:
                                 break
@@ -1743,7 +1799,7 @@ class SteamStatusMonitorF(Star):
                 continue  # 防止重复推送
 
             # --- 开始游戏/继续游戏（仅当 gameid 变更时推送） ---
-            if current_gameid not in [None, "", "0"] and current_gameid != prev_gameid:
+            if not self._is_empty_gameid(current_gameid) and current_gameid != prev_gameid:
                 quit_info = pending_quit.setdefault(sid, {}).get(current_gameid)
                 # 检查是否为网络波动（3分钟内重启同一游戏）
                 if quit_info and now - quit_info["quit_time"] <= 180 and not quit_info.get("notified"):
@@ -1772,7 +1828,7 @@ class SteamStatusMonitorF(Star):
                     last_states[sid] = status
                     continue  # 只推送网络波动提醒，跳过后续逻辑
                 # 修复：补充开始游戏推送逻辑
-                start_play_times.setdefault(sid, {})[current_gameid] = now
+                self._ensure_start_play_time_map(start_play_times, sid, current_gameid).setdefault(current_gameid, now)
                 # 游戏播报过滤检查
                 if self._is_game_filtered(group_id, zh_game_name):
                     logger.info(f"[播报过滤] {name} 开始的游戏「{zh_game_name}」在过滤列表中，跳过推送")
